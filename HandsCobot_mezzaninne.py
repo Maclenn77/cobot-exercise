@@ -5,9 +5,11 @@ Control an xArm with one hand tracked by MediaPipe.
   a fixed vertical plane (arm depth/X stays constant). The wrist is used
   instead of the index fingertip so that pinching to close the gripper
   doesn't also drag the arm's tracked position.
-- Wrist rotation (the twist of the wrist->middle-finger-MCP vector, in the
-  camera plane) drives the end effector's yaw, so rotating your wrist
-  rotates the gripper.
+- Wrist rotation (twisting the forearm, like turning a key) drives the end
+  effector's yaw. Detected from the index-MCP/pinky-MCP palm-width vector
+  using MediaPipe's estimated landmark depth (z), since that twist mostly
+  moves one side of the palm toward/away from the camera rather than
+  sideways in the image.
 - Pinch distance between thumb tip and index fingertip toggles a vacuum
   gripper connected to digital IO 0 (closed/suction-on when pinched).
 - The forward/back arm depth (X) is not hand-tracked; it's nudged a fixed
@@ -37,12 +39,19 @@ KEY_UP = {2490368, 65362, 63232}
 KEY_DOWN = {2621440, 65364, 63233}
 
 SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
-EMA_ALPHA = 0.3               # smoothing factor for exponential moving average
+EMA_ALPHA = 0.2                # smoothing factor for exponential moving average (lower = smoother/laggier)
 
 YAW_LIMIT = 90                 # max +/- wrist-twist rotation applied to the gripper (deg)
 
-SPEED = 200                   # mm/s for servo streaming
-MVACC = 2000                  # mm/s^2
+# set_servo_cartesian is a streaming interface meant for frequent, small,
+# steady updates; our per-camera-frame updates are comparatively sparse and
+# noisy, so we run it gently (low speed/accel) and skip re-sending targets
+# that haven't moved meaningfully, to avoid vibration from restarting/
+# re-braking the motion on every noisy frame.
+SPEED = 80                    # mm/s for servo streaming
+MVACC = 500                   # mm/s^2
+POS_DEADBAND = 3               # mm; ignore Y/Z changes smaller than this
+YAW_DEADBAND = 2               # deg; ignore yaw changes smaller than this
 
 PINCH_CLOSE_DIST = 50         # px distance below which gripper closes (suction on)
 PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction off)
@@ -87,6 +96,8 @@ def main():
     dy_filtered = 0.0
     dz_filtered = Z_HOME
     yaw_filtered = 0.0
+    last_sent_x = x_pos
+    last_sent_y, last_sent_z, last_sent_yaw = dy_filtered, dz_filtered, yaw_filtered
     gripper_closed = False
 
     try:
@@ -118,25 +129,40 @@ def main():
                     wx = hand.landmark[mp_hands.HandLandmark.WRIST].x * width
                     wy = hand.landmark[mp_hands.HandLandmark.WRIST].y * height
 
-                    mx = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].x * width
-                    my = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].y * height
+                    # Palm-width vector (index-MCP -> pinky-MCP), used with MediaPipe's
+                    # estimated depth (z) to detect wrist twist (pronation/supination).
+                    # A vector along the forearm axis (e.g. wrist -> middle-MCP) can't see
+                    # this rotation since that axis IS the axis being rotated around; a
+                    # vector across the palm foreshortens/depth-shifts as it twists instead.
+                    index_mcp = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_MCP]
+                    pinky_mcp = hand.landmark[mp_hands.HandLandmark.PINKY_MCP]
+                    ix, iz = index_mcp.x * width, index_mcp.z * width
+                    px, pz = pinky_mcp.x * width, pinky_mcp.z * width
 
                     # Map wrist position (pixels) to arm Y/Z (mm), clipped to safe bounds.
                     dy = np.clip((wx - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
                     dz = np.clip((center_y - wy) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
 
-                    # Wrist-twist angle (wrist -> middle-finger-MCP vector, in the camera
-                    # plane): 0 deg when the hand points straight up toward the camera.
-                    yaw = np.clip(np.degrees(np.arctan2(mx - wx, wy - my)),
+                    # 0 deg when the palm faces the camera flatly (index/pinky MCP at the
+                    # same depth); swings toward +-90 deg as the palm twists to profile.
+                    yaw = np.clip(np.degrees(np.arctan2(pz - iz, px - ix)),
                                   -YAW_LIMIT, YAW_LIMIT)
 
                     dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
                     dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
                     yaw_filtered = EMA_ALPHA * yaw + (1 - EMA_ALPHA) * yaw_filtered
 
-                    arm.set_servo_cartesian(
-                        [x_pos, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
-                        speed=SPEED, mvacc=MVACC)
+                    # Skip re-sending targets that haven't moved meaningfully, so residual
+                    # jitter from the filtered signal doesn't keep re-triggering motion.
+                    if (x_pos != last_sent_x
+                            or abs(dy_filtered - last_sent_y) > POS_DEADBAND
+                            or abs(dz_filtered - last_sent_z) > POS_DEADBAND
+                            or abs(yaw_filtered - last_sent_yaw) > YAW_DEADBAND):
+                        arm.set_servo_cartesian(
+                            [x_pos, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
+                            speed=SPEED, mvacc=MVACC)
+                        last_sent_x = x_pos
+                        last_sent_y, last_sent_z, last_sent_yaw = dy_filtered, dz_filtered, yaw_filtered
 
                     # Pinch gesture (thumb tip <-> index fingertip) controls the vacuum
                     # gripper, with hysteresis so we only send an IO command on state
