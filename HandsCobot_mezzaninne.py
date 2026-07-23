@@ -1,8 +1,13 @@
 """
 Control an xArm with one hand tracked by MediaPipe.
 
-- Index fingertip position (X/Y in the camera frame) drives the arm's Y/Z
-  position in a fixed vertical plane (arm depth/X stays constant).
+- Wrist position (X/Y in the camera frame) drives the arm's Y/Z position in
+  a fixed vertical plane (arm depth/X stays constant). The wrist is used
+  instead of the index fingertip so that pinching to close the gripper
+  doesn't also drag the arm's tracked position.
+- Wrist rotation (the twist of the wrist->middle-finger-MCP vector, in the
+  camera plane) drives the end effector's yaw, so rotating your wrist
+  rotates the gripper.
 - Pinch distance between thumb tip and index fingertip toggles a vacuum
   gripper connected to digital IO 0 (closed/suction-on when pinched).
 """
@@ -22,6 +27,8 @@ Z_HOME = (Z_MIN + Z_MAX) / 2
 
 SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
 EMA_ALPHA = 0.3               # smoothing factor for exponential moving average
+
+YAW_LIMIT = 90                 # max +/- wrist-twist rotation applied to the gripper (deg)
 
 SPEED = 200                   # mm/s for servo streaming
 MVACC = 2000                  # mm/s^2
@@ -67,6 +74,7 @@ def main():
 
     dy_filtered = 0.0
     dz_filtered = Z_HOME
+    yaw_filtered = 0.0
     gripper_closed = False
 
     try:
@@ -93,19 +101,34 @@ def main():
                     x2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * width
                     y2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * height
 
-                    # Map hand position (pixels) to arm Y/Z (mm), clipped to safe bounds.
-                    dy = np.clip((x2 - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
-                    dz = np.clip((center_y - y2) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
+                    # Wrist position drives arm Y/Z. Unlike the fingertips, it doesn't
+                    # move when pinching, so closing the gripper no longer drags the arm.
+                    wx = hand.landmark[mp_hands.HandLandmark.WRIST].x * width
+                    wy = hand.landmark[mp_hands.HandLandmark.WRIST].y * height
+
+                    mx = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].x * width
+                    my = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].y * height
+
+                    # Map wrist position (pixels) to arm Y/Z (mm), clipped to safe bounds.
+                    dy = np.clip((wx - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
+                    dz = np.clip((center_y - wy) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
+
+                    # Wrist-twist angle (wrist -> middle-finger-MCP vector, in the camera
+                    # plane): 0 deg when the hand points straight up toward the camera.
+                    yaw = np.clip(np.degrees(np.arctan2(mx - wx, wy - my)),
+                                  -YAW_LIMIT, YAW_LIMIT)
 
                     dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
                     dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
+                    yaw_filtered = EMA_ALPHA * yaw + (1 - EMA_ALPHA) * yaw_filtered
 
                     arm.set_servo_cartesian(
-                        [X_FIXED, dy_filtered, dz_filtered, -180, 0, 0],
+                        [X_FIXED, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
                         speed=SPEED, mvacc=MVACC)
 
-                    # Pinch gesture controls the vacuum gripper, with hysteresis
-                    # so we only send an IO command on state changes.
+                    # Pinch gesture (thumb tip <-> index fingertip) controls the vacuum
+                    # gripper, with hysteresis so we only send an IO command on state
+                    # changes. This no longer affects arm position (see wrist tracking above).
                     dist = np.hypot(x2 - x1, y2 - y1)
                     if dist < PINCH_CLOSE_DIST and not gripper_closed:
                         arm.set_cgpio_digital(GRIPPER_IO, 1, delay_sec=0)
@@ -115,7 +138,8 @@ def main():
                         gripper_closed = False
 
                     cv2.putText(frame, f"y={dy_filtered:.0f} z={dz_filtered:.0f} "
-                                        f"pinch={dist:.0f} grip={'CLOSED' if gripper_closed else 'OPEN'}",
+                                        f"yaw={yaw_filtered:.0f} pinch={dist:.0f} "
+                                        f"grip={'CLOSED' if gripper_closed else 'OPEN'}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 cv2.imshow("Control xArm con Ventosa y Filtro", frame)
