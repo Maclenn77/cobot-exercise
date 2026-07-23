@@ -16,7 +16,13 @@ Control an xArm with one hand tracked by MediaPipe.
   step at a time with the Up/Down arrow keys or W/S (both do the same
   thing, so either a left or right hand can rest on the keyboard) while
   the video window has focus.
+- Pressing Tab appends the arm's current actual pose (x, y, z, roll, pitch,
+  yaw) as a row to a CSV file, for building a palletization routine from
+  recorded waypoints.
 """
+import csv
+import os
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -37,6 +43,7 @@ Z_HOME = (Z_MIN + Z_MAX) / 2
 # cover the common ones (Windows, Linux/GTK, macOS/Cocoa).
 KEY_UP = {2490368, 65362, 63232}
 KEY_DOWN = {2621440, 65364, 63233}
+KEY_TAB = 9   # standard ASCII, consistent across platforms
 
 SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
 EMA_ALPHA = 0.2                # smoothing factor for exponential moving average (lower = smoother/laggier)
@@ -57,6 +64,9 @@ PINCH_CLOSE_DIST = 50         # px distance below which gripper closes (suction 
 PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction off)
 
 GRIPPER_IO = 0
+
+POINTS_CSV_PATH = 'palletization_points.csv'  # where recorded waypoints are appended
+POINTS_CSV_HEADER = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
 
 
 def connect_arm():
@@ -91,6 +101,18 @@ def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+
+    write_header = not os.path.exists(POINTS_CSV_PATH) or os.path.getsize(POINTS_CSV_PATH) == 0
+    points_file = open(POINTS_CSV_PATH, 'a', newline='')
+    points_writer = csv.writer(points_file)
+    if write_header:
+        points_writer.writerow(POINTS_CSV_HEADER)
+        points_file.flush()
+    recorded_count = 0
+
+    limits_text = (f"limits: x[{X_MIN:.0f},{X_MAX:.0f}] y[-{Y_LIMIT:.0f},{Y_LIMIT:.0f}] "
+                   f"z[{Z_MIN:.0f},{Z_MAX:.0f}] yaw[-{YAW_LIMIT:.0f},{YAW_LIMIT:.0f}]  "
+                   f"(edit these constants at the top of the script)")
 
     x_pos = X_HOME
     dy_filtered = 0.0
@@ -183,6 +205,11 @@ def main():
                     cv2.putText(frame, f"x={x_pos:.0f}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+                cv2.putText(frame, limits_text, (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+                cv2.putText(frame, f"points recorded: {recorded_count} (Tab to record, saved to {POINTS_CSV_PATH})",
+                            (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
                 cv2.imshow("Control xArm con Ventosa y Filtro", frame)
 
                 key = cv2.waitKeyEx(1)
@@ -192,9 +219,18 @@ def main():
                     x_pos = min(x_pos + X_STEP, X_MAX)
                 elif key in KEY_DOWN or key in (ord('s'), ord('S')):
                     x_pos = max(x_pos - X_STEP, X_MIN)
+                elif key == KEY_TAB:
+                    code, pose = arm.get_position()
+                    if code == 0:
+                        points_writer.writerow(pose)
+                        points_file.flush()
+                        recorded_count += 1
+                    else:
+                        print(f"Could not read arm position (code={code}), point not recorded.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        points_file.close()
         arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
         arm.set_mode(0)
         arm.set_state(state=0)
