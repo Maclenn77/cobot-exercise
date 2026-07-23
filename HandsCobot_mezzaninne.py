@@ -10,6 +10,10 @@ Control an xArm with one hand tracked by MediaPipe.
   rotates the gripper.
 - Pinch distance between thumb tip and index fingertip toggles a vacuum
   gripper connected to digital IO 0 (closed/suction-on when pinched).
+- The forward/back arm depth (X) is not hand-tracked; it's nudged a fixed
+  step at a time with the Up/Down arrow keys or W/S (both do the same
+  thing, so either a left or right hand can rest on the keyboard) while
+  the video window has focus.
 """
 import cv2
 import mediapipe as mp
@@ -20,10 +24,17 @@ from xarm.wrapper import XArmAPI
 ROBOT_IP = '192.168.1.205'   # xArm IP address
 CAMERA_INDEX = 1             # OpenCV camera index
 
-X_FIXED = 200                # Fixed forward/back distance (mm)
+X_HOME = 200                 # Starting forward/back distance (mm)
+X_MIN, X_MAX = 150, 350      # Forward/back travel bounds (mm)
+X_STEP = 5                   # mm nudged per Up/Down or W/S key press
 Y_LIMIT = 200                # Max +/- Y travel from center (mm)
 Z_MIN, Z_MAX = 150, 350      # Vertical travel bounds (mm)
 Z_HOME = (Z_MIN + Z_MAX) / 2
+
+# Arrow-key codes returned by cv2.waitKeyEx() vary by platform/backend, so
+# cover the common ones (Windows, Linux/GTK, macOS/Cocoa).
+KEY_UP = {2490368, 65362, 63232}
+KEY_DOWN = {2621440, 65364, 63233}
 
 SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
 EMA_ALPHA = 0.3               # smoothing factor for exponential moving average
@@ -52,7 +63,7 @@ def connect_arm():
     arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
 
     # Move to a safe starting pose before switching to streaming mode.
-    arm.set_position(x=X_FIXED, y=0, z=Z_HOME, roll=-180, pitch=0, yaw=0,
+    arm.set_position(x=X_HOME, y=0, z=Z_HOME, roll=-180, pitch=0, yaw=0,
                       speed=50, wait=True)
 
     # Servo (streaming) mode: designed for frequent, low-latency position
@@ -72,6 +83,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
+    x_pos = X_HOME
     dy_filtered = 0.0
     dz_filtered = Z_HOME
     yaw_filtered = 0.0
@@ -123,7 +135,7 @@ def main():
                     yaw_filtered = EMA_ALPHA * yaw + (1 - EMA_ALPHA) * yaw_filtered
 
                     arm.set_servo_cartesian(
-                        [X_FIXED, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
+                        [x_pos, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
                         speed=SPEED, mvacc=MVACC)
 
                     # Pinch gesture (thumb tip <-> index fingertip) controls the vacuum
@@ -137,14 +149,23 @@ def main():
                         arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
                         gripper_closed = False
 
-                    cv2.putText(frame, f"y={dy_filtered:.0f} z={dz_filtered:.0f} "
+                    cv2.putText(frame, f"x={x_pos:.0f} y={dy_filtered:.0f} z={dz_filtered:.0f} "
                                         f"yaw={yaw_filtered:.0f} pinch={dist:.0f} "
                                         f"grip={'CLOSED' if gripper_closed else 'OPEN'}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    cv2.putText(frame, f"x={x_pos:.0f}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 cv2.imshow("Control xArm con Ventosa y Filtro", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
+
+                key = cv2.waitKeyEx(1)
+                if key == 27:
                     break
+                elif key in KEY_UP or key in (ord('w'), ord('W')):
+                    x_pos = min(x_pos + X_STEP, X_MAX)
+                elif key in KEY_DOWN or key in (ord('s'), ord('S')):
+                    x_pos = max(x_pos - X_STEP, X_MIN)
     finally:
         cap.release()
         cv2.destroyAllWindows()
