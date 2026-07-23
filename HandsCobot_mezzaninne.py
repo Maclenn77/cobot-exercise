@@ -16,9 +16,9 @@ Control an xArm with one hand tracked by MediaPipe.
   step at a time with the Up/Down arrow keys or W/S (both do the same
   thing, so either a left or right hand can rest on the keyboard) while
   the video window has focus.
-- Pressing Tab appends the arm's current actual pose (x, y, z, roll, pitch,
-  yaw) as a row to a CSV file, for building a palletization routine from
-  recorded waypoints.
+- Pressing Space appends the arm's current actual pose (x, y, z, roll,
+  pitch, yaw) as a row to a CSV file, for building a palletization routine
+  from recorded waypoints.
 """
 import csv
 import os
@@ -43,7 +43,7 @@ Z_HOME = (Z_MIN + Z_MAX) / 2
 # cover the common ones (Windows, Linux/GTK, macOS/Cocoa).
 KEY_UP = {2490368, 65362, 63232}
 KEY_DOWN = {2621440, 65364, 63233}
-KEY_TAB = 9   # standard ASCII, consistent across platforms
+KEY_RECORD = 32   # spacebar; standard ASCII, consistent across platforms
 
 SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
 EMA_ALPHA = 0.2                # smoothing factor for exponential moving average (lower = smoother/laggier)
@@ -207,7 +207,7 @@ def main():
 
                 cv2.putText(frame, limits_text, (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-                cv2.putText(frame, f"points recorded: {recorded_count} (Tab to record, saved to {POINTS_CSV_PATH})",
+                cv2.putText(frame, f"points recorded: {recorded_count} (Space to record, saved to {POINTS_CSV_PATH})",
                             (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
                 cv2.imshow("Control xArm con Ventosa y Filtro", frame)
@@ -219,7 +219,7 @@ def main():
                     x_pos = min(x_pos + X_STEP, X_MAX)
                 elif key in KEY_DOWN or key in (ord('s'), ord('S')):
                     x_pos = max(x_pos - X_STEP, X_MIN)
-                elif key == KEY_TAB:
+                elif key == KEY_RECORD:
                     code, pose = arm.get_position()
                     if code == 0:
                         points_writer.writerow(pose)
