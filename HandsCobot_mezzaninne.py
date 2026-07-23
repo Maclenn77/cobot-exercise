@@ -5,15 +5,19 @@ Control an xArm with one hand tracked by MediaPipe.
   joints) drives the arm's Y/Z position in a fixed vertical plane (arm
   depth/X stays constant). These knuckle joints barely move when the hand
   opens/closes, so closing the gripper (below) doesn't drag the arm.
-  The very first hand detected each run snaps the arm straight to that
-  position; after that, a new Y/Z target only takes effect once it has
-  held past the dead-band for HOLD_TIME seconds, so brief/involuntary
-  hand movement is ignored and only a sustained, deliberate move commits.
+  Live tracking doesn't engage until the hand is first seen near the
+  home/center crosshair (within START_TOLERANCE), so the arm never jumps
+  to match wherever the hand happened to be when the script started --
+  align to the crosshair once, then tracking picks up from there. After
+  that, a new Y/Z target only takes effect once it has held past the
+  dead-band for HOLD_TIME seconds, so brief/involuntary hand movement is
+  ignored and only a sustained, deliberate move commits.
 - An on-screen box shows the workspace the hand maps to (matching the
   Y/Z limits below) with a crosshair at the home/center position, so you
   can see where to hold your hand to match a given arm position. The
-  tracked-hand marker is green when settled, yellow while a move is
-  "holding" before it commits, and red when the hand has left the box.
+  tracked-hand marker is magenta before tracking engages, green once
+  settled, yellow while a move is "holding" before it commits, and red
+  when the hand has left the box.
 - Hand openness (average fingertip-to-palm-center distance) toggles a
   vacuum gripper connected to digital IO 0: closed fist = gripper closed
   (suction on), open hand = gripper open (suction off).
@@ -72,6 +76,12 @@ SPEED = 50                   # mm/s for live hand-tracking movement
 MVACC = 300                  # mm/s^2
 POS_DEADBAND = 15            # mm; ignore Y/Z changes smaller than this
 HOLD_TIME = 0.4              # seconds a Y/Z change must persist before it commits
+
+# Live tracking doesn't engage until the hand is first seen within this
+# distance (mm-equivalent) of home/center, so the arm never jumps to match
+# wherever the hand happened to be when the script started -- you align to
+# the on-screen crosshair first, then tracking picks up from there.
+START_TOLERANCE = 30
 
 FIST_CLOSE_DIST = 60          # px avg fingertip-to-palm-center distance below which gripper closes
 FIST_OPEN_DIST = 110          # px avg fingertip-to-palm-center distance above which gripper opens
@@ -191,15 +201,16 @@ def main():
                     dz = np.clip((center_y - hy) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
 
                     if not tracking_initialized:
-                        # Snap straight to the hand's first-seen position instead of
-                        # ramping from a hardcoded home value or waiting out the
-                        # hold-time gate below -- otherwise the arm looks frozen
-                        # until the hand happens to pass back through "home".
-                        dy_filtered = dy
-                        dz_filtered = dz
-                        last_sent_y = dy
-                        last_sent_z = dz
-                        tracking_initialized = True
+                        # Tracking doesn't engage until the hand is seen near home, so
+                        # the arm never jumps to match wherever the hand happened to be
+                        # when the script started. Until then the arm just holds at its
+                        # current commanded position (home).
+                        if abs(dy) <= START_TOLERANCE and abs(dz - Z_HOME) <= START_TOLERANCE:
+                            dy_filtered = dy
+                            dz_filtered = dz
+                            last_sent_y = dy
+                            last_sent_z = dz
+                            tracking_initialized = True
                     else:
                         dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
                         dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
@@ -241,9 +252,15 @@ def main():
                         arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
                         gripper_closed = False
 
-                    # Hand marker: red once the hand leaves the mapped box, yellow
-                    # while a move is held pending commit, green once settled.
-                    if not (box_tl[0] <= hx <= box_br[0] and box_tl[1] <= hy <= box_br[1]):
+                    # Hand marker: magenta before tracking has engaged (move to the
+                    # crosshair to start), red once tracking has started but the hand
+                    # has left the mapped box, yellow while a move is held pending
+                    # commit, green once settled.
+                    if not tracking_initialized:
+                        marker_color = (255, 0, 255)
+                        cv2.putText(frame, "Move hand to the crosshair to start tracking",
+                                    (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    elif not (box_tl[0] <= hx <= box_br[0] and box_tl[1] <= hy <= box_br[1]):
                         marker_color = (0, 0, 255)
                     elif y_pending_since is not None or z_pending_since is not None:
                         marker_color = (0, 220, 255)
