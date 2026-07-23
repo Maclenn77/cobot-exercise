@@ -66,8 +66,9 @@ EMA_ALPHA = 0.15              # smoothing factor for exponential moving average 
 # commits once it has stayed past the dead-band continuously for HOLD_TIME
 # seconds -- short/unintentional hand movement never reaches the arm at
 # all, rather than just being smoothed.
-SPEED = 30                   # mm/s for servo streaming (80 was enough to shake the table/mount)
-MVACC = 200                  # mm/s^2
+SPEED = 300                  # mm/s for servo streaming (xArm 6 rated max is ~1000mm/s; 80% of
+                              # that, ~800mm/s, was enough to shake the table/mount, 30%/~300 was fine)
+MVACC = 2000                 # mm/s^2
 POS_DEADBAND = 15            # mm; ignore Y/Z changes smaller than this
 HOLD_TIME = 0.4              # seconds a Y/Z change must persist before it commits
 
