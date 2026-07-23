@@ -1,79 +1,134 @@
+"""
+Control an xArm with one hand tracked by MediaPipe.
+
+- Index fingertip position (X/Y in the camera frame) drives the arm's Y/Z
+  position in a fixed vertical plane (arm depth/X stays constant).
+- Pinch distance between thumb tip and index fingertip toggles a vacuum
+  gripper connected to digital IO 0 (closed/suction-on when pinched).
+"""
 import cv2
 import mediapipe as mp
 import numpy as np
 from xarm.wrapper import XArmAPI
 
-# Configura el xArm
-arm = XArmAPI('192.168.1.205')  # Cambia por la IP del robot
-arm.motion_enable(enable=True)
-arm.set_mode(0)
-arm.set_state(state=0)
+# ---- Configuration ----
+ROBOT_IP = '192.168.1.205'   # xArm IP address
+CAMERA_INDEX = 1             # OpenCV camera index
 
-# Posición inicial
-x_pos = 200
-arm.set_position(x=x_pos, y=0, z=200, roll=-180, pitch=0, yaw=0, speed=50, wait=True)
+X_FIXED = 200                # Fixed forward/back distance (mm)
+Y_LIMIT = 200                # Max +/- Y travel from center (mm)
+Z_MIN, Z_MAX = 150, 350      # Vertical travel bounds (mm)
+Z_HOME = (Z_MIN + Z_MAX) / 2
 
-# MediaPipe
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
+EMA_ALPHA = 0.3               # smoothing factor for exponential moving average
 
-cap = cv2.VideoCapture(1)
+SPEED = 200                   # mm/s for servo streaming
+MVACC = 2000                  # mm/s^2
 
-# Mapeo de coordenadas
-centro_x, centro_y = 320, 240
-escala_y, escala_z = 0.5, 0.5
+PINCH_CLOSE_DIST = 50         # px distance below which gripper closes (suction on)
+PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction off)
 
-# Filtro EMA
-alpha = 0.3
-
-dy_filtrado = 0
-dz_filtrado = 200
-
-with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7) as hands:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
-
-        if result.multi_hand_landmarks:
-            for hand in result.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-
-                x1 = int(hand.landmark[mp_hands.HandLandmark.THUMB_TIP].x * frame.shape[1])
-                y1 = int(hand.landmark[mp_hands.HandLandmark.THUMB_TIP].y * frame.shape[0])
-
-                x2 = int(hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * frame.shape[1])
-                y2 = int(hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * frame.shape[0])
-
-                # Conversión a mm
-                dy = np.clip((x2 - centro_x) * escala_y, -200, 200)
-                dz = np.clip((centro_y - y2) * escala_z, 150, 350)
-
-                # Aplicar filtro EMA
-                dy_filtrado = alpha * dy + (1 - alpha) * dy_filtrado
-                dz_filtrado = alpha * dz + (1 - alpha) * dz_filtrado
-
-                # Mover el robot con suavizado
-                #arm.set_position(x=x_pos, y=dy_filtrado, z=dz_filtrado,
-                #                 roll=-180, pitch=0, yaw=0, speed=100, wait=False)
-
-                # Control del gripper
-                dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                if dist < 50:
-                    arm.set_cgpio_digital(0, 1, delay_sec=0)
-                elif dist > 100:
-                    arm.set_cgpio_digital(0, 0, delay_sec=0)
+GRIPPER_IO = 0
 
 
+def connect_arm():
+    arm = XArmAPI(ROBOT_IP)
+    arm.motion_enable(enable=True)
+    arm.set_mode(0)
+    arm.set_state(state=0)
+    if arm.error_code != 0:
+        arm.clean_error()
+        arm.motion_enable(enable=True)
+        arm.set_state(state=0)
 
-        cv2.imshow("Control xArm con Ventosa y Filtro", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+    arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
 
-cap.release()
-cv2.destroyAllWindows()
-arm.disconnect()
+    # Move to a safe starting pose before switching to streaming mode.
+    arm.set_position(x=X_FIXED, y=0, z=Z_HOME, roll=-180, pitch=0, yaw=0,
+                      speed=50, wait=True)
+
+    # Servo (streaming) mode: designed for frequent, low-latency position
+    # updates, unlike mode 0 which queues each set_position as a discrete move.
+    arm.set_mode(1)
+    arm.set_state(state=0)
+    return arm
+
+
+def main():
+    arm = connect_arm()
+
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+
+    dy_filtered = 0.0
+    dz_filtered = Z_HOME
+    gripper_closed = False
+
+    try:
+        with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7) as hands:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = cv2.flip(frame, 1)
+                height, width, _ = frame.shape
+                center_x, center_y = width / 2, height / 2
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                result = hands.process(rgb)
+
+                if result.multi_hand_landmarks:
+                    hand = result.multi_hand_landmarks[0]
+                    mp_drawing.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+
+                    x1 = hand.landmark[mp_hands.HandLandmark.THUMB_TIP].x * width
+                    y1 = hand.landmark[mp_hands.HandLandmark.THUMB_TIP].y * height
+
+                    x2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * width
+                    y2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * height
+
+                    # Map hand position (pixels) to arm Y/Z (mm), clipped to safe bounds.
+                    dy = np.clip((x2 - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
+                    dz = np.clip((center_y - y2) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
+
+                    dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
+                    dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
+
+                    arm.set_servo_cartesian(
+                        [X_FIXED, dy_filtered, dz_filtered, -180, 0, 0],
+                        speed=SPEED, mvacc=MVACC)
+
+                    # Pinch gesture controls the vacuum gripper, with hysteresis
+                    # so we only send an IO command on state changes.
+                    dist = np.hypot(x2 - x1, y2 - y1)
+                    if dist < PINCH_CLOSE_DIST and not gripper_closed:
+                        arm.set_cgpio_digital(GRIPPER_IO, 1, delay_sec=0)
+                        gripper_closed = True
+                    elif dist > PINCH_OPEN_DIST and gripper_closed:
+                        arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
+                        gripper_closed = False
+
+                    cv2.putText(frame, f"y={dy_filtered:.0f} z={dz_filtered:.0f} "
+                                        f"pinch={dist:.0f} grip={'CLOSED' if gripper_closed else 'OPEN'}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                cv2.imshow("Control xArm con Ventosa y Filtro", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
+        arm.set_mode(0)
+        arm.set_state(state=0)
+        arm.disconnect()
+
+
+if __name__ == '__main__':
+    main()
