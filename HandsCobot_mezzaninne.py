@@ -1,20 +1,22 @@
 """
 Control an xArm with one hand tracked by MediaPipe.
 
-- Wrist position (X/Y in the camera frame) drives the arm's Y/Z position in
-  a fixed vertical plane (arm depth/X stays constant). The wrist is used
-  instead of the index fingertip so that pinching to close the gripper
-  doesn't also drag the arm's tracked position. A new Y/Z target only takes
-  effect once the tracked position has held past the dead-band for
-  HOLD_TIME seconds, so brief/involuntary hand movement is ignored and only
-  a sustained, deliberate move commits.
-- An on-screen box shows the workspace the wrist maps to (matching the
+- The hand center (centroid of the wrist and the four finger MCP/knuckle
+  joints) drives the arm's Y/Z position in a fixed vertical plane (arm
+  depth/X stays constant). These knuckle joints barely move when the hand
+  opens/closes, so closing the gripper (below) doesn't drag the arm.
+  The very first hand detected each run snaps the arm straight to that
+  position; after that, a new Y/Z target only takes effect once it has
+  held past the dead-band for HOLD_TIME seconds, so brief/involuntary
+  hand movement is ignored and only a sustained, deliberate move commits.
+- An on-screen box shows the workspace the hand maps to (matching the
   Y/Z limits below) with a crosshair at the home/center position, so you
   can see where to hold your hand to match a given arm position. The
-  tracked-wrist marker is green when settled, yellow while a move is
+  tracked-hand marker is green when settled, yellow while a move is
   "holding" before it commits, and red when the hand has left the box.
-- Pinch distance between thumb tip and index fingertip toggles a vacuum
-  gripper connected to digital IO 0 (closed/suction-on when pinched).
+- Hand openness (average fingertip-to-palm-center distance) toggles a
+  vacuum gripper connected to digital IO 0: closed fist = gripper closed
+  (suction on), open hand = gripper open (suction off).
 - The forward/back arm depth (X) is not hand-tracked; it's nudged a fixed
   step at a time with the Up/Down arrow keys or W/S.
 - The end effector's yaw is not hand-tracked either (wrist-twist detection
@@ -72,8 +74,8 @@ MVACC = 2000                 # mm/s^2
 POS_DEADBAND = 15            # mm; ignore Y/Z changes smaller than this
 HOLD_TIME = 0.4              # seconds a Y/Z change must persist before it commits
 
-PINCH_CLOSE_DIST = 50         # px distance below which gripper closes (suction on)
-PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction off)
+FIST_CLOSE_DIST = 60          # px avg fingertip-to-palm-center distance below which gripper closes
+FIST_OPEN_DIST = 110          # px avg fingertip-to-palm-center distance above which gripper opens
 
 GRIPPER_IO = 0
 
@@ -131,8 +133,8 @@ def main():
                    f"(edit these constants at the top of the script)")
     controls_text = "controls: W/S or Up/Down = depth  |  A/D or Left/Right = yaw  |  Space = record point  |  ESC = quit"
 
-    # Pixel-space half-size of the box the wrist maps to, derived from the
-    # same scale factors used to convert wrist position into Y/Z (mm).
+    # Pixel-space half-size of the box the hand maps to, derived from the
+    # same scale factors used to convert hand position into Y/Z (mm).
     half_w_px = Y_LIMIT / SCALE_Y
     half_h_px = ((Z_MAX - Z_MIN) / 2) / SCALE_Z
 
@@ -143,6 +145,7 @@ def main():
     last_sent_y, last_sent_z = dy_filtered, dz_filtered
     y_pending_since = None
     z_pending_since = None
+    tracking_initialized = False
     gripper_closed = False
 
     try:
@@ -172,70 +175,85 @@ def main():
                 if result.multi_hand_landmarks:
                     hand = result.multi_hand_landmarks[0]
                     mp_drawing.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+                    lm = hand.landmark
 
-                    x1 = hand.landmark[mp_hands.HandLandmark.THUMB_TIP].x * width
-                    y1 = hand.landmark[mp_hands.HandLandmark.THUMB_TIP].y * height
+                    # Hand center: centroid of the wrist and the four finger MCP
+                    # (knuckle) joints. Unlike a fingertip, these barely move when the
+                    # hand opens/closes into a fist, so the grip gesture below doesn't
+                    # drag the tracked position.
+                    palm_ids = (mp_hands.HandLandmark.WRIST, mp_hands.HandLandmark.INDEX_FINGER_MCP,
+                                mp_hands.HandLandmark.MIDDLE_FINGER_MCP, mp_hands.HandLandmark.RING_FINGER_MCP,
+                                mp_hands.HandLandmark.PINKY_MCP)
+                    hx = np.mean([lm[i].x for i in palm_ids]) * width
+                    hy = np.mean([lm[i].y for i in palm_ids]) * height
 
-                    x2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * width
-                    y2 = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * height
+                    # Map hand-center position (pixels) to arm Y/Z (mm), clipped to safe bounds.
+                    dy = np.clip((hx - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
+                    dz = np.clip((center_y - hy) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
 
-                    # Wrist position drives arm Y/Z. Unlike the fingertips, it doesn't
-                    # move when pinching, so closing the gripper no longer drags the arm.
-                    wx = hand.landmark[mp_hands.HandLandmark.WRIST].x * width
-                    wy = hand.landmark[mp_hands.HandLandmark.WRIST].y * height
+                    if not tracking_initialized:
+                        # Snap straight to the hand's first-seen position instead of
+                        # ramping from a hardcoded home value or waiting out the
+                        # hold-time gate below -- otherwise the arm looks frozen
+                        # until the hand happens to pass back through "home".
+                        dy_filtered = dy
+                        dz_filtered = dz
+                        last_sent_y = dy
+                        last_sent_z = dz
+                        tracking_initialized = True
+                    else:
+                        dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
+                        dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
 
-                    # Map wrist position (pixels) to arm Y/Z (mm), clipped to safe bounds.
-                    dy = np.clip((wx - center_x) * SCALE_Y, -Y_LIMIT, Y_LIMIT)
-                    dz = np.clip((center_y - wy) * SCALE_Z + Z_HOME, Z_MIN, Z_MAX)
-
-                    dy_filtered = EMA_ALPHA * dy + (1 - EMA_ALPHA) * dy_filtered
-                    dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
-
-                    # A change only commits once it has stayed past the dead-band
-                    # continuously for HOLD_TIME seconds; a move that bounces back
-                    # within the dead-band before then resets the hold and never
-                    # reaches the arm.
-                    if abs(dy_filtered - last_sent_y) > POS_DEADBAND:
-                        if y_pending_since is None:
-                            y_pending_since = now
-                        elif now - y_pending_since >= HOLD_TIME:
-                            last_sent_y = dy_filtered
+                        # A change only commits once it has stayed past the dead-band
+                        # continuously for HOLD_TIME seconds; a move that bounces back
+                        # within the dead-band before then resets the hold and never
+                        # reaches the arm.
+                        if abs(dy_filtered - last_sent_y) > POS_DEADBAND:
+                            if y_pending_since is None:
+                                y_pending_since = now
+                            elif now - y_pending_since >= HOLD_TIME:
+                                last_sent_y = dy_filtered
+                                y_pending_since = None
+                        else:
                             y_pending_since = None
-                    else:
-                        y_pending_since = None
 
-                    if abs(dz_filtered - last_sent_z) > POS_DEADBAND:
-                        if z_pending_since is None:
-                            z_pending_since = now
-                        elif now - z_pending_since >= HOLD_TIME:
-                            last_sent_z = dz_filtered
+                        if abs(dz_filtered - last_sent_z) > POS_DEADBAND:
+                            if z_pending_since is None:
+                                z_pending_since = now
+                            elif now - z_pending_since >= HOLD_TIME:
+                                last_sent_z = dz_filtered
+                                z_pending_since = None
+                        else:
                             z_pending_since = None
-                    else:
-                        z_pending_since = None
 
-                    # Pinch gesture (thumb tip <-> index fingertip) controls the vacuum
-                    # gripper, with hysteresis so we only send an IO command on state
-                    # changes. This no longer affects arm position (see wrist tracking above).
-                    dist = np.hypot(x2 - x1, y2 - y1)
-                    if dist < PINCH_CLOSE_DIST and not gripper_closed:
+                    # Hand openness (average fingertip-to-palm-center distance, thumb
+                    # excluded since it doesn't curl the same way) controls the vacuum
+                    # gripper: small = fist = gripper closed, large = open hand = gripper
+                    # open. Hysteresis avoids chattering at the threshold. Uses the same
+                    # stable hand-center point as above, so this doesn't affect arm position.
+                    tip_ids = (mp_hands.HandLandmark.INDEX_FINGER_TIP, mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+                               mp_hands.HandLandmark.RING_FINGER_TIP, mp_hands.HandLandmark.PINKY_TIP)
+                    openness = np.mean([np.hypot(lm[i].x * width - hx, lm[i].y * height - hy) for i in tip_ids])
+                    if openness < FIST_CLOSE_DIST and not gripper_closed:
                         arm.set_cgpio_digital(GRIPPER_IO, 1, delay_sec=0)
                         gripper_closed = True
-                    elif dist > PINCH_OPEN_DIST and gripper_closed:
+                    elif openness > FIST_OPEN_DIST and gripper_closed:
                         arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
                         gripper_closed = False
 
-                    # Wrist marker: red once the hand leaves the mapped box, yellow
+                    # Hand marker: red once the hand leaves the mapped box, yellow
                     # while a move is held pending commit, green once settled.
-                    if not (box_tl[0] <= wx <= box_br[0] and box_tl[1] <= wy <= box_br[1]):
+                    if not (box_tl[0] <= hx <= box_br[0] and box_tl[1] <= hy <= box_br[1]):
                         marker_color = (0, 0, 255)
                     elif y_pending_since is not None or z_pending_since is not None:
                         marker_color = (0, 220, 255)
                     else:
                         marker_color = (0, 255, 0)
-                    cv2.circle(frame, (int(wx), int(wy)), 10, marker_color, -1)
+                    cv2.circle(frame, (int(hx), int(hy)), 10, marker_color, -1)
 
                     cv2.putText(frame, f"x={x_pos:.0f} y={dy_filtered:.0f} z={dz_filtered:.0f} yaw={yaw_pos:.0f} "
-                                        f"pinch={dist:.0f} grip={'CLOSED' if gripper_closed else 'OPEN'}",
+                                        f"open={openness:.0f} grip={'CLOSED' if gripper_closed else 'OPEN'}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
                     cv2.putText(frame, f"x={x_pos:.0f} yaw={yaw_pos:.0f}",
