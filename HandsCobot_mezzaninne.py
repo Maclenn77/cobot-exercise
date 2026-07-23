@@ -107,9 +107,15 @@ def connect_arm():
 
     arm.set_cgpio_digital(GRIPPER_IO, 0, delay_sec=0)
 
-    # Move to a safe starting pose before switching to streaming mode.
-    arm.set_position(x=X_HOME, y=0, z=Z_HOME, roll=-180, pitch=0, yaw=0,
-                      speed=50, wait=True)
+    # Move to a safe starting pose before switching to streaming mode. Print
+    # the return code and the position actually reported back, so a silent
+    # failure or a requested-vs-actual mismatch (e.g. a TCP/tool offset
+    # configured differently between a real robot and a simulator) is
+    # visible instead of just "the pose looks wrong" with no clue why.
+    code = arm.set_position(x=X_HOME, y=0, z=Z_HOME, roll=-180, pitch=0, yaw=0,
+                             speed=50, wait=True)
+    print(f"Home set_position -> code={code}, error_code={arm.error_code}, warn_code={arm.warn_code}")
+    print(f"Home get_position -> {arm.get_position()} (requested x={X_HOME}, y=0, z={Z_HOME}, roll=-180, pitch=0, yaw=0)")
 
     # Servo (streaming) mode: designed for frequent, low-latency position
     # updates, unlike mode 0 which queues each set_position as a discrete move.
