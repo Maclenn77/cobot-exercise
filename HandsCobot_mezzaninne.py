@@ -40,10 +40,10 @@ ROBOT_IP = '192.168.1.205'   # xArm IP address
 CAMERA_INDEX = 1             # OpenCV camera index
 
 X_HOME = 200                 # Starting forward/back distance (mm)
-X_MIN, X_MAX = 150, 350      # Forward/back travel bounds (mm)
+X_MIN, X_MAX = 150, 360      # Forward/back travel bounds (mm)
 X_STEP = 5                   # mm nudged per Up/Down or W/S key press
 Y_LIMIT = 200                # Max +/- Y travel from center (mm)
-Z_MIN, Z_MAX = 150, 350      # Vertical travel bounds (mm)
+Z_MIN, Z_MAX = -70, 255      # Vertical travel bounds (mm)
 Z_HOME = (Z_MIN + Z_MAX) / 2
 
 YAW_LIMIT = 90                # Max +/- end-effector yaw (deg)
