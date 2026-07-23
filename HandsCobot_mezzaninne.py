@@ -45,8 +45,8 @@ KEY_UP = {2490368, 65362, 63232}
 KEY_DOWN = {2621440, 65364, 63233}
 KEY_RECORD = 32   # spacebar; standard ASCII, consistent across platforms
 
-SCALE_Y, SCALE_Z = 0.5, 0.5  # pixel-to-mm scale factors
-EMA_ALPHA = 0.2                # smoothing factor for exponential moving average (lower = smoother/laggier)
+SCALE_Y, SCALE_Z = 0.3, 0.3  # pixel-to-mm scale factors (lower = less arm movement per pixel of hand movement)
+EMA_ALPHA = 0.15               # smoothing factor for exponential moving average (lower = smoother/laggier)
 
 YAW_LIMIT = 90                 # max +/- wrist-twist rotation applied to the gripper (deg)
 
@@ -54,11 +54,13 @@ YAW_LIMIT = 90                 # max +/- wrist-twist rotation applied to the gri
 # steady updates; our per-camera-frame updates are comparatively sparse and
 # noisy, so we run it gently (low speed/accel) and hold the target steady
 # (dead-band) until the filtered signal moves meaningfully, instead of
-# forwarding every bit of tracking noise straight into the arm.
+# forwarding every bit of tracking noise straight into the arm. These
+# dead-bands are deliberately generous: small/unintentional hand jitter
+# should be fully absorbed, so only clearly deliberate movement gets through.
 SPEED = 80                    # mm/s for servo streaming
 MVACC = 500                   # mm/s^2
-POS_DEADBAND = 3               # mm; ignore Y/Z changes smaller than this
-YAW_DEADBAND = 2               # deg; ignore yaw changes smaller than this
+POS_DEADBAND = 15              # mm; ignore Y/Z changes smaller than this
+YAW_DEADBAND = 8               # deg; ignore yaw changes smaller than this
 
 PINCH_CLOSE_DIST = 50         # px distance below which gripper closes (suction on)
 PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction off)
