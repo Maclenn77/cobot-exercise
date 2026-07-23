@@ -52,9 +52,9 @@ YAW_LIMIT = 90                 # max +/- wrist-twist rotation applied to the gri
 
 # set_servo_cartesian is a streaming interface meant for frequent, small,
 # steady updates; our per-camera-frame updates are comparatively sparse and
-# noisy, so we run it gently (low speed/accel) and skip re-sending targets
-# that haven't moved meaningfully, to avoid vibration from restarting/
-# re-braking the motion on every noisy frame.
+# noisy, so we run it gently (low speed/accel) and hold the target steady
+# (dead-band) until the filtered signal moves meaningfully, instead of
+# forwarding every bit of tracking noise straight into the arm.
 SPEED = 80                    # mm/s for servo streaming
 MVACC = 500                   # mm/s^2
 POS_DEADBAND = 3               # mm; ignore Y/Z changes smaller than this
@@ -65,7 +65,10 @@ PINCH_OPEN_DIST = 100         # px distance above which gripper opens (suction o
 
 GRIPPER_IO = 0
 
-POINTS_CSV_PATH = 'palletization_points.csv'  # where recorded waypoints are appended
+# Anchored to the script's own folder so the CSV always lands next to it,
+# regardless of the current working directory the script is launched from.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+POINTS_CSV_PATH = os.path.join(SCRIPT_DIR, 'palletization_points.csv')
 POINTS_CSV_HEADER = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
 
 
@@ -102,6 +105,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
+    print(f"Recording points to: {POINTS_CSV_PATH}")
     write_header = not os.path.exists(POINTS_CSV_PATH) or os.path.getsize(POINTS_CSV_PATH) == 0
     points_file = open(POINTS_CSV_PATH, 'a', newline='')
     points_writer = csv.writer(points_file)
@@ -174,17 +178,24 @@ def main():
                     dz_filtered = EMA_ALPHA * dz + (1 - EMA_ALPHA) * dz_filtered
                     yaw_filtered = EMA_ALPHA * yaw + (1 - EMA_ALPHA) * yaw_filtered
 
-                    # Skip re-sending targets that haven't moved meaningfully, so residual
-                    # jitter from the filtered signal doesn't keep re-triggering motion.
-                    if (x_pos != last_sent_x
-                            or abs(dy_filtered - last_sent_y) > POS_DEADBAND
-                            or abs(dz_filtered - last_sent_z) > POS_DEADBAND
-                            or abs(yaw_filtered - last_sent_yaw) > YAW_DEADBAND):
-                        arm.set_servo_cartesian(
-                            [x_pos, dy_filtered, dz_filtered, -180, 0, yaw_filtered],
-                            speed=SPEED, mvacc=MVACC)
+                    # Hold the last sent target unless the change clears the dead-band, so
+                    # residual jitter from the filtered signal doesn't keep nudging the arm.
+                    # We still call set_servo_cartesian every frame regardless: mode 1 is a
+                    # streaming interface that expects a steady flow of commands, and pausing
+                    # calls for a few frames (as an earlier version of this script did by
+                    # skipping the send entirely) causes the arm to snap when calls resume.
+                    if x_pos != last_sent_x:
                         last_sent_x = x_pos
-                        last_sent_y, last_sent_z, last_sent_yaw = dy_filtered, dz_filtered, yaw_filtered
+                    if abs(dy_filtered - last_sent_y) > POS_DEADBAND:
+                        last_sent_y = dy_filtered
+                    if abs(dz_filtered - last_sent_z) > POS_DEADBAND:
+                        last_sent_z = dz_filtered
+                    if abs(yaw_filtered - last_sent_yaw) > YAW_DEADBAND:
+                        last_sent_yaw = yaw_filtered
+
+                    arm.set_servo_cartesian(
+                        [last_sent_x, last_sent_y, last_sent_z, -180, 0, last_sent_yaw],
+                        speed=SPEED, mvacc=MVACC)
 
                     # Pinch gesture (thumb tip <-> index fingertip) controls the vacuum
                     # gripper, with hysteresis so we only send an IO command on state
